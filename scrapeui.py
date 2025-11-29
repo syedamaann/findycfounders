@@ -9,6 +9,40 @@ from webdriver_manager.chrome import ChromeDriverManager
 from bs4 import BeautifulSoup
 import time
 import gradio as gr
+from curl_cffi import requests
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+def scrape_company_fast(company_link):
+    """Worker function to scrape a single company concurrently."""
+    # handle case where link is relative or absolute
+    if company_link.startswith("http"):
+        url = company_link
+    else:
+        url = f"https://www.ycombinator.com{company_link}"
+
+    try:
+        # impersonate="chrome" tricks Cloudflare into thinking we are a real browser
+        response = requests.get(url, impersonate="chrome", timeout=10)
+        
+        if response.status_code != 200:
+            return None
+            
+        soup = BeautifulSoup(response.content, "html.parser")
+        
+        # Fast CSS selector for social links
+        social_links = soup.select('a[href*="x.com"], a[href*="twitter.com"]')
+        
+        found_handles = []
+        for link in social_links:
+            href = link.get('href', '')
+            if "intent/tweet" not in href and "share" not in href:
+                found_handles.append(href)
+                
+        return list(set(found_handles)) # Remove duplicates
+        
+    except Exception as e:
+        print(f"Failed to scrape {url}: {e}")
+        return None
 
 def scroll_to_load_all_companies(driver):
     """Scroll down the page to load all companies."""
@@ -67,54 +101,46 @@ def scrape_twitter_urls(start_url):
                 if '/companies/' in href and href not in company_links:
                     company_links.append(href)
 
+        # Close Selenium driver early as we don't need it for individual pages anymore
+        driver.quit()
+
         twitter_handles = []
         companies_with_no_twitter = 0
 
-        # --- BLOCK 3: EXTRACT TWITTER HANDLES ---
-        print(f"Found {len(company_links)} companies. Starting scrape...")
-
-        for company_link in company_links:
-            # handle case where link is relative or absolute
-            if company_link.startswith("http"):
-                 company_url = company_link
-            else:
-                 company_url = f"https://www.ycombinator.com{company_link}"
-
-            driver.get(company_url)
+        # --- BLOCK 3: EXTRACT TWITTER HANDLES (FAST PARALLEL) ---
+        print(f"Found {len(company_links)} companies. Starting fast scrape with curl_cffi...")
+        
+        # We scrape 10 companies at the same time
+        with ThreadPoolExecutor(max_workers=10) as executor:
+            # Submit all tasks
+            future_to_url = {executor.submit(scrape_company_fast, link): link for link in company_links}
             
-            try:
-                # FIX: Don't wait for a specific class that might change. Wait for the body.
-                WebDriverWait(driver, 5).until(EC.presence_of_element_located((By.TAG_NAME, "body")))
+            for i, future in enumerate(as_completed(future_to_url)):
+                handles = future.result()
                 
-                company_soup = BeautifulSoup(driver.page_source, "html.parser")
-                
-                # FIX: Use CSS Selectors to find ANY link containing x.com or twitter.com
-                social_links = company_soup.select('a[href*="x.com"], a[href*="twitter.com"]')
-                
-                found_on_page = False
-                for link in social_links:
-                    url = link['href']
-                    # Avoid sharing intents (e.g., "share this page on twitter")
-                    if "intent/tweet" not in url and "share" not in url:
-                        if url not in twitter_handles:
-                            twitter_handles.append(url)
-                            found_on_page = True
-                
-                if not found_on_page:
+                if handles:
+                    twitter_handles.extend(handles)
+                else:
                     companies_with_no_twitter += 1
-            
-            except Exception as e:
-                print(f"Error scraping {company_url}: {e}")
-                companies_with_no_twitter += 1
-                continue
-            
-            # Be nice to the server
-            time.sleep(1)
+                
+                # Optional: Print progress
+                if (i + 1) % 10 == 0:
+                    print(f"Processed {i + 1}/{len(company_links)}")
+
+        # Remove duplicates from the final list while preserving order (optional)
+        twitter_handles = list(set(twitter_handles))
 
         return twitter_handles, len(company_links), len(twitter_handles), companies_with_no_twitter, None
 
+    except Exception as e:
+        return [], 0, 0, 0, f"Unexpected error: {str(e)}"
+    
     finally:
-        driver.quit()
+        # Ensure driver is closed if it wasn't closed earlier
+        try:
+            driver.quit()
+        except:
+            pass
 
 def run_gradio(start_url):
     result = scrape_twitter_urls(start_url)
