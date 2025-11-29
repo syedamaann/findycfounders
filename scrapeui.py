@@ -5,6 +5,7 @@ from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.chrome.service import Service as ChromeService
 from selenium.webdriver.chrome.options import Options
 from selenium.common.exceptions import TimeoutException
+from webdriver_manager.chrome import ChromeDriverManager
 from bs4 import BeautifulSoup
 import time
 import gradio as gr
@@ -27,62 +28,102 @@ def scrape_twitter_urls(start_url):
     chrome_options.add_argument("--headless")
     chrome_options.add_argument("--disable-gpu")
     chrome_options.add_argument("--no-sandbox")
+    chrome_options.add_argument("--disable-dev-shm-usage")
+    chrome_options.add_argument("--window-size=1920,1080")
+    # Added User Agent to avoid being blocked as a bot
+    chrome_options.add_argument("user-agent=Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
     
-    service = ChromeService(executable_path='./chromedriver')  # Replace with your WebDriver path
+    service = ChromeService(ChromeDriverManager().install())
     driver = webdriver.Chrome(service=service, options=chrome_options)
     
-    driver.get(start_url)
-    
     try:
-        WebDriverWait(driver, 20).until(EC.presence_of_element_located((By.CSS_SELECTOR, "._company_86jzd_338")))
-    except TimeoutException:
-        driver.quit()
-        return [], "Error: Timed out waiting for page to load", 0, 0
-    
-    # Scroll to load all companies
-    scroll_to_load_all_companies(driver)
-
-    # Parse the main page to get company links
-    soup = BeautifulSoup(driver.page_source, "html.parser")
-    company_links = [a['href'] for a in soup.select("._company_86jzd_338")]
-
-    twitter_handles = []
-    companies_with_no_twitter = 0
-
-    # Iterate through each company link
-    for company_link in company_links:
-        company_url = f"https://www.ycombinator.com{company_link}"
-        driver.get(company_url)
+        driver.get(start_url)
+        time.sleep(3)
         
-        try:
-            # Wait for the company page to load and check for the presence of the Twitter icon
-            WebDriverWait(driver, 10).until(EC.presence_of_element_located((By.CSS_SELECTOR, ".bg-image-twitter")))
-            
-            # Parse the company page
-            company_soup = BeautifulSoup(driver.page_source, "html.parser")
-            
-            # Find the Twitter URL
-            twitter_element = company_soup.find("a", class_="inline-block h-5 w-5 bg-contain bg-image-twitter")
-            
-            if twitter_element and 'href' in twitter_element.attrs:
-                twitter_url = twitter_element['href']
-                twitter_handles.append(twitter_url)
+        # --- BLOCK 1: GET COMPANY LINKS ---
+        company_links = []
+        soup = BeautifulSoup(driver.page_source, "html.parser")
+        
+        # Fallback method (Most reliable for YC's current layout)
+        all_links = soup.find_all('a', href=True)
+        for link in all_links:
+            href = link['href']
+            # Check if it looks like a company profile link
+            if '/companies/' in href and href not in company_links:
+                company_links.append(href)
+        
+        if not company_links:
+            return [], 0, 0, 0, "Error: Could not find company links. Page structure may have changed."
+        
+        # --- BLOCK 2: SCROLLING ---
+        if company_links:
+            scroll_to_load_all_companies(driver)
+            # Re-parse after scrolling to get all companies
+            soup = BeautifulSoup(driver.page_source, "html.parser")
+            all_links = soup.find_all('a', href=True)
+            company_links = []
+            for link in all_links:
+                href = link['href']
+                if '/companies/' in href and href not in company_links:
+                    company_links.append(href)
+
+        twitter_handles = []
+        companies_with_no_twitter = 0
+
+        # --- BLOCK 3: EXTRACT TWITTER HANDLES ---
+        print(f"Found {len(company_links)} companies. Starting scrape...")
+
+        for company_link in company_links:
+            # handle case where link is relative or absolute
+            if company_link.startswith("http"):
+                 company_url = company_link
             else:
-                companies_with_no_twitter += 1
-        
-        except TimeoutException:
-            companies_with_no_twitter += 1
-            continue  # Move on to the next company URL
-        
-        # Optional: Sleep to avoid too rapid requests
-        time.sleep(1)
+                 company_url = f"https://www.ycombinator.com{company_link}"
 
-    driver.quit()
-    
-    return twitter_handles, len(company_links), len(twitter_handles), companies_with_no_twitter
+            driver.get(company_url)
+            
+            try:
+                # FIX: Don't wait for a specific class that might change. Wait for the body.
+                WebDriverWait(driver, 5).until(EC.presence_of_element_located((By.TAG_NAME, "body")))
+                
+                company_soup = BeautifulSoup(driver.page_source, "html.parser")
+                
+                # FIX: Use CSS Selectors to find ANY link containing x.com or twitter.com
+                social_links = company_soup.select('a[href*="x.com"], a[href*="twitter.com"]')
+                
+                found_on_page = False
+                for link in social_links:
+                    url = link['href']
+                    # Avoid sharing intents (e.g., "share this page on twitter")
+                    if "intent/tweet" not in url and "share" not in url:
+                        if url not in twitter_handles:
+                            twitter_handles.append(url)
+                            found_on_page = True
+                
+                if not found_on_page:
+                    companies_with_no_twitter += 1
+            
+            except Exception as e:
+                print(f"Error scraping {company_url}: {e}")
+                companies_with_no_twitter += 1
+                continue
+            
+            # Be nice to the server
+            time.sleep(1)
+
+        return twitter_handles, len(company_links), len(twitter_handles), companies_with_no_twitter, None
+
+    finally:
+        driver.quit()
 
 def run_gradio(start_url):
-    twitter_handles, total_companies, total_twitter, no_twitter = scrape_twitter_urls(start_url)
+    result = scrape_twitter_urls(start_url)
+    twitter_handles, total_companies, total_twitter, no_twitter, error_msg = result
+    
+    # Handle error case
+    if error_msg:
+        return f"<div style='border:1px solid #ff6b6b; padding:10px; color: #d63031;'><b>Error:</b> {error_msg}</div>"
+    
     clickable_links = "<br>".join([f'<a href="{url}" target="_blank">{url}</a>' for url in twitter_handles])
     
     stats = f"""
